@@ -55,8 +55,13 @@ function urlToLocalPath(urlStr: string, isPage: boolean): string {
   const u = new URL(urlStr);
   let pathname = decodeURIComponent(u.pathname);
 
-  // Build path: hostname/path
-  const segments = [sanitizeSegment(u.hostname)];
+  // All files go under the main site hostname folder.
+  // For external domains, nest under _assets/<domain> to avoid collisions.
+  const siteHostname = new URL(siteOrigin).hostname;
+  const segments = [sanitizeSegment(siteHostname)];
+  if (u.hostname !== siteHostname) {
+    segments.push("_assets", sanitizeSegment(u.hostname));
+  }
 
   const parts = pathname.split("/").filter(Boolean);
   for (const p of parts) {

@@ -1,0 +1,24 @@
+{
+  "name": "SiteCrawler3000",
+  "version": "1.0.0",
+  "description": "Download an entire website by crawling its sitemap",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "crawl": "tsx src/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.30.0",
+  "dependencies": {
+    "@types/node": "^25.5.0",
+    "cheerio": "^1.2.0",
+    "typescript": "^6.0.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}

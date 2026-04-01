@@ -303,6 +303,28 @@ function extractRefs(html: string, baseUrl: string): ExtractedRefs {
     }
   });
 
+  // Alternate language links (hreflang)
+  $('link[rel="alternate"][href]').each((_, el) => {
+    const href = $(el).attr("href");
+    if (href) {
+      const abs = normalizeUrl(href, baseUrl);
+      if (abs && isDomainAllowed(abs)) {
+        pages.push(abs);
+      }
+    }
+  });
+
+  // Inline style url() references (e.g. background-image)
+  $("[style]").each((_, el) => {
+    const style = $(el).attr("style");
+    if (style) {
+      const styleUrls = extractCssUrls(style, baseUrl);
+      for (const u of styleUrls) {
+        if (isDomainAllowed(u)) assets.push(u);
+      }
+    }
+  });
+
   // Open Graph / meta images
   $("meta[content]").each((_, el) => {
     const prop = $(el).attr("property") || $(el).attr("name") || "";
@@ -312,6 +334,18 @@ function extractRefs(html: string, baseUrl: string): ExtractedRefs {
         const abs = normalizeUrl(content, baseUrl);
         if (abs) assets.push(abs);
       }
+    }
+  });
+
+  // Inline <script> blocks: extract quoted paths that look like assets
+  $("script:not([src])").each((_, el) => {
+    const code = $(el).html();
+    if (!code) return;
+    const re = /["'](\/[^"'\s]+\.(?:png|jpe?g|gif|svg|webp|ico|css|js|woff2?|ttf|eot|mp4|webm|mp3|ogg|pdf))["']/gi;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(code)) !== null) {
+      const abs = normalizeUrl(m[1], baseUrl);
+      if (abs && isDomainAllowed(abs)) assets.push(abs);
     }
   });
 
@@ -455,6 +489,58 @@ function rewriteAll() {
   }
 }
 
+function htmlEncodeUrl(url: string): string {
+  return url.replace(/&/g, "&amp;");
+}
+
+function replaceUrlVariants(
+  html: string,
+  originalUrl: string,
+  rel: string
+): string {
+  // Build all variants of the URL that might appear in the raw HTML
+  const variants: string[] = [originalUrl];
+
+  // HTML-entity-encoded version (& -> &amp;) - critical for URLs with query params
+  const ampEncoded = htmlEncodeUrl(originalUrl);
+  if (ampEncoded !== originalUrl) variants.push(ampEncoded);
+
+  try {
+    const u = new URL(originalUrl);
+
+    // Protocol-relative
+    const protoRel = "//" + u.host + u.pathname + u.search;
+    variants.push(protoRel);
+    const protoRelAmp = htmlEncodeUrl(protoRel);
+    if (protoRelAmp !== protoRel) variants.push(protoRelAmp);
+
+    // Path-only for same-origin refs (including root "/")
+    if (u.origin === siteOrigin) {
+      const pathOnly = u.pathname + u.search;
+      if (pathOnly.length >= 1) {
+        variants.push(pathOnly);
+        const pathOnlyAmp = htmlEncodeUrl(pathOnly);
+        if (pathOnlyAmp !== pathOnly) variants.push(pathOnlyAmp);
+      }
+    }
+  } catch { /* skip */ }
+
+  // Sort longest first to avoid partial replacements
+  variants.sort((a, b) => b.length - a.length);
+
+  for (const variant of variants) {
+    const escaped = escapeRegex(variant);
+    // Match URL in quotes or parentheses (attribute values & url())
+    const pattern = new RegExp(
+      `(["'(])\\s*${escaped}\\s*(["')])`,
+      "g"
+    );
+    html = html.replace(pattern, (_, open, close) => `${open}${rel}${close}`);
+  }
+
+  return html;
+}
+
 function rewriteHtml(
   filePath: string,
   localPath: string,
@@ -470,46 +556,7 @@ function rewriteHtml(
   for (const originalUrl of urlsToReplace) {
     const targetLocal = lookup.get(originalUrl)!;
     const rel = relativePath(localPath, targetLocal);
-
-    // Replace occurrences in attributes (href, src, content, etc.)
-    // Use a pattern that matches the URL in quotes or parentheses
-    const escaped = escapeRegex(originalUrl);
-    const pattern = new RegExp(
-      `(["'(])\\s*${escaped}\\s*(["')])`,
-      "g"
-    );
-    html = html.replace(pattern, (_, open, close) => `${open}${rel}${close}`);
-
-    // Also handle protocol-relative version
-    try {
-      const u = new URL(originalUrl);
-      const protoRelative = "//" + u.host + u.pathname + u.search;
-      const escapedPR = escapeRegex(protoRelative);
-      const patternPR = new RegExp(
-        `(["'(])\\s*${escapedPR}\\s*(["')])`,
-        "g"
-      );
-      html = html.replace(
-        patternPR,
-        (_, open, close) => `${open}${rel}${close}`
-      );
-
-      // And path-only version (for same-origin refs)
-      if (u.origin === siteOrigin) {
-        const pathOnly = u.pathname + u.search;
-        if (pathOnly.length > 1) {
-          const escapedPath = escapeRegex(pathOnly);
-          const patternPath = new RegExp(
-            `(["'(])\\s*${escapedPath}\\s*(["')])`,
-            "g"
-          );
-          html = html.replace(
-            patternPath,
-            (_, open, close) => `${open}${rel}${close}`
-          );
-        }
-      }
-    } catch { /* skip */ }
+    html = replaceUrlVariants(html, originalUrl, rel);
   }
 
   fs.writeFileSync(filePath, html);
@@ -543,16 +590,18 @@ function rewriteCss(
       `@import "${rel}"`
     );
 
-    // Also path-only for same-origin
+    // Also path-only for same-origin (including root path)
     try {
       const u = new URL(originalUrl);
-      if (u.origin === siteOrigin && u.pathname.length > 1) {
+      if (u.origin === siteOrigin) {
         const pathOnly = u.pathname + u.search;
-        const escapedPath = escapeRegex(pathOnly);
-        css = css.replace(
-          new RegExp(`url\\(\\s*['"]?${escapedPath}['"]?\\s*\\)`, "g"),
-          `url(${rel})`
-        );
+        if (pathOnly.length >= 1) {
+          const escapedPath = escapeRegex(pathOnly);
+          css = css.replace(
+            new RegExp(`url\\(\\s*['"]?${escapedPath}['"]?\\s*\\)`, "g"),
+            `url(${rel})`
+          );
+        }
       }
     } catch { /* skip */ }
   }

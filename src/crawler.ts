@@ -16,7 +16,7 @@ const failed = new Set<string>();
 let destination = "out";
 let allowedDomains = new Set<string>();
 let siteOrigin = "";
-let throttle = false;
+let delayMs = 0;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -120,7 +120,7 @@ async function fetchUrl(
     }
     const ct = resp.headers.get("content-type") || "application/octet-stream";
     const buf = Buffer.from(await resp.arrayBuffer());
-    if (throttle) await sleep(1000);
+    if (delayMs > 0) await sleep(delayMs);
     return { data: buf, contentType: ct };
   } catch (err: any) {
     error(`  ⚠ fetch error ${url}: ${err.message}`);
@@ -328,7 +328,7 @@ function extractRefs(html: string, baseUrl: string): ExtractedRefs {
   // Open Graph / meta images
   $("meta[content]").each((_, el) => {
     const prop = $(el).attr("property") || $(el).attr("name") || "";
-    if (prop.includes("image") || prop.includes("icon")) {
+    if ((prop === "og:image" || prop === "twitter:image" || prop === "twitter:image:source" || prop.includes("icon")) && !prop.includes(":width") && !prop.includes(":height")) {
       const content = $(el).attr("content");
       if (content) {
         const abs = normalizeUrl(content, baseUrl);
@@ -378,23 +378,31 @@ export async function crawl(
   siteUrl: string,
   domains: Set<string>,
   dest: string,
-  enableThrottle: boolean = false
+  delay: number = 0,
+  urlList?: string[],
+  noDiscover: boolean = false
 ) {
   destination = dest;
   allowedDomains = domains;
   siteOrigin = new URL(siteUrl).origin;
-  throttle = enableThrottle;
+  delayMs = delay;
 
-  // 1. Get page list from sitemap
-  const sitemapUrls = await fetchSitemapUrls(siteUrl);
-  log(`\nFound ${sitemapUrls.length} URL(s) in sitemap.\n`);
+  // 1. Get page list from file or sitemap
+  let sitemapUrls: string[];
+  if (urlList && urlList.length > 0) {
+    log("\nUsing URLs from file (skipping sitemap fetch).");
+    sitemapUrls = [siteUrl + "/", ...urlList];
+  } else {
+    sitemapUrls = await fetchSitemapUrls(siteUrl);
+  }
+  log(`\nFound ${sitemapUrls.length} URL(s) to crawl.\n`);
 
-  // 2. Download all pages & discover assets
+  // 2. Download pages & their assets together
   const pageQueue = [...sitemapUrls];
   const seen = new Set<string>();
-  const assetQueue: string[] = [];
+  const assetSeen = new Set<string>();
 
-  log("=== Downloading pages ===");
+  log("=== Downloading pages & assets ===");
   while (pageQueue.length > 0) {
     const url = pageQueue.shift()!;
     const norm = normalizeUrl(url, siteOrigin);
@@ -409,37 +417,35 @@ export async function crawl(
     const html = fs.readFileSync(fullPath, "utf-8");
     const refs = extractRefs(html, norm);
 
-    for (const p of refs.pages) {
-      const pn = normalizeUrl(p);
-      if (pn && !seen.has(pn)) pageQueue.push(pn);
+    if (!noDiscover) {
+      for (const p of refs.pages) {
+        const pn = normalizeUrl(p);
+        if (pn && !seen.has(pn)) pageQueue.push(pn);
+      }
     }
-    for (const a of refs.assets) {
-      assetQueue.push(a);
-    }
-  }
 
-  // 3. Download all assets (including CSS sub-assets)
-  log("\n=== Downloading assets ===");
-  const assetSeen = new Set<string>();
-  while (assetQueue.length > 0) {
-    const url = assetQueue.shift()!;
-    const norm = normalizeUrl(url);
-    if (!norm || assetSeen.has(norm)) continue;
-    assetSeen.add(norm);
+    // Download this page's assets immediately
+    const assetQueue: string[] = [...refs.assets];
+    while (assetQueue.length > 0) {
+      const assetUrl = assetQueue.shift()!;
+      const assetNorm = normalizeUrl(assetUrl);
+      if (!assetNorm || assetSeen.has(assetNorm)) continue;
+      assetSeen.add(assetNorm);
 
-    const entry = await download(norm, false);
-    if (!entry) continue;
+      const assetEntry = await download(assetNorm, false);
+      if (!assetEntry) continue;
 
-    // If CSS, parse for sub-assets
-    if (
-      entry.contentType.includes("css") ||
-      entry.localPath.endsWith(".css")
-    ) {
-      const fullPath = path.join(destination, entry.localPath);
-      const css = fs.readFileSync(fullPath, "utf-8");
-      const subUrls = extractCssUrls(css, norm);
-      for (const su of subUrls) {
-        if (!assetSeen.has(su)) assetQueue.push(su);
+      // If CSS, parse for sub-assets
+      if (
+        assetEntry.contentType.includes("css") ||
+        assetEntry.localPath.endsWith(".css")
+      ) {
+        const cssPath = path.join(destination, assetEntry.localPath);
+        const css = fs.readFileSync(cssPath, "utf-8");
+        const subUrls = extractCssUrls(css, assetNorm);
+        for (const su of subUrls) {
+          if (!assetSeen.has(su)) assetQueue.push(su);
+        }
       }
     }
   }
@@ -514,8 +520,8 @@ function replaceUrlVariants(
     const protoRelAmp = htmlEncodeUrl(protoRel);
     if (protoRelAmp !== protoRel) variants.push(protoRelAmp);
 
-    // Path-only for same-origin refs (including root "/")
-    if (u.origin === siteOrigin) {
+    // Path-only for same-origin or allowed-domain refs
+    if (u.origin === siteOrigin || allowedDomains.has(u.hostname)) {
       const pathOnly = u.pathname + u.search;
       if (pathOnly.length >= 1) {
         variants.push(pathOnly);
@@ -590,10 +596,10 @@ function rewriteCss(
       `@import "${rel}"`
     );
 
-    // Also path-only for same-origin (including root path)
+    // Also path-only for same-origin or allowed-domain refs
     try {
       const u = new URL(originalUrl);
-      if (u.origin === siteOrigin) {
+      if (u.origin === siteOrigin || allowedDomains.has(u.hostname)) {
         const pathOnly = u.pathname + u.search;
         if (pathOnly.length >= 1) {
           const escapedPath = escapeRegex(pathOnly);
